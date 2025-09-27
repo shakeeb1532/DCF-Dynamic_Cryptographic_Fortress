@@ -289,8 +289,13 @@ def cmd_encrypt(args: argparse.Namespace) -> None:
 
     # Build layered cipher plan from policy output
     layers: List[LayerSpec] = []
+    # Ensure plan.ciphers has enough elements for plan.layers
+    ciphers = plan.ciphers
+    if len(ciphers) < plan.layers:
+        # Repeat or extend the cipher list to match layers
+        ciphers = (ciphers * ((plan.layers // len(ciphers)) + 1))[:plan.layers]
     for i in range(plan.layers):
-        alg = plan.ciphers[i]
+        alg = ciphers[i]
         key = os.urandom(32)
         nonce = os.urandom(12)
         layers.append(LayerSpec(alg, key, nonce))
@@ -427,3 +432,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
