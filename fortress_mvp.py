@@ -1,3 +1,4 @@
+# Copyright 2025 shakeeb1532
 #!/usr/bin/env python3
 """
 Dynamic Cryptographic Fortress — Minimal Viable Product (single-file CLI)
