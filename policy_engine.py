@@ -23,6 +23,10 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Protocol
 import ipaddress
 import hashlib
+# --- Self-aware engine deps (add these) ---
+from DCF.features import ctx_to_feature_dict, feats_to_vector, FEATURE_KEYS
+from DCF.optimizer_bandit import BanditOptimizer
+import logging
 
 # ---------- Data models ----------
 
@@ -179,15 +183,125 @@ class MLClassifierEngine:
             rationale=rationale,
             seed=seed,
         )
+# ===== Self-Aware Engine (Advisor + Bandit + Guardrails) =====
+
+# Secure, allowed cipher sets — ensure these EXACT strings match your executor
+SAFE_ACTIONS = {
+    # action_id -> recipe spec
+    "safe_l2_aes_chacha": dict(layers=2, ciphers=["AESGCM", "ChaCha20-Poly1305"]),
+    "safe_l3_mix":        dict(layers=3, ciphers=["AESGCM", "ChaCha20-Poly1305", "AESGCM"]),
+    "safe_l4_extreme":    dict(layers=4, ciphers=["AESGCM", "ChaCha20-Poly1305", "AESGCM", "ChaCha20-Poly1305"]),
+}
+
+def _recipe_is_safe(r: "Recipe") -> bool:
+    """Guardrail: enforce minimum security and allowed ciphers before use."""
+    try:
+        if int(r.layers) < 2:
+            return False
+        names = [str(c).lower() for c in (r.ciphers or [])]
+        has_aesgcm = any("aesgcm" in n for n in names)
+        has_chacha = any("chacha20" in n for n in names)
+        return has_aesgcm and has_chacha
+    except Exception:
+        return False
+
+def _choose_compression(size_bytes: int) -> str:
+    mb = (size_bytes or 0) / (1024 * 1024)
+    if mb < 1:
+        return "none"
+    if mb < 64:
+        return "zlib"
+    return "lz4"
+
+def _extract_confidence(recipe: "Recipe"):
+    """Parse 'conf=0.xx' from ML rationale if present; else None."""
+    for line in getattr(recipe, "rationale", []) or []:
+        if "conf=" in line:
+            try:
+                return float(line.split("conf=")[1].split(")")[0])
+            except Exception:
+                pass
+    return None
+
+def _ml_available() -> bool:
+    try:
+        e = get_engine("ml")
+        return getattr(e, "model", None) is not None
+    except Exception:
+        return False
+
+class SelfAwareEngine:
+    """
+    Chooses policies by combining:
+      - Advisor: your ML or rules engine (for initial suggestion + confidence)
+      - Optimizer: LinUCB contextual bandit (learns best safe action per context)
+      - Guardrails: enforce minimum security and safe cipher allow-list
+    """
+    def __init__(self, min_confidence: float = 0.60, alpha: float = 0.8):
+        self.min_conf = float(min_confidence)
+        self.bandit = BanditOptimizer(d=len(FEATURE_KEYS), alpha=alpha)
+        # Prefer ML if available; otherwise rules
+        try:
+            self._advisor = get_engine("ml") if _ml_available() else get_engine("rule")
+        except Exception:
+            self._advisor = get_engine("rule")
+
+    def plan(self, ctx: "Context") -> "Recipe":
+        feats = ctx_to_feature_dict(ctx)
+        x_vec = feats_to_vector(feats)
+
+        # Ask advisor first
+        base = self._advisor.plan(ctx)
+        advisor_conf = _extract_confidence(base)
+        compression = _choose_compression(getattr(ctx, "file_size_bytes", 0))
+
+        # If advisor is confident AND safe, use it directly
+        if advisor_conf is not None and advisor_conf >= self.min_conf and _recipe_is_safe(base):
+            base.compression = compression
+            (base.rationale or []).insert(0, f"Advisor confident ({advisor_conf:.2f}); using advisor recipe.")
+            return base
+
+        # Otherwise: pick among SAFE actions via bandit
+        action_ids = list(SAFE_ACTIONS.keys())
+        chosen_action, scores = self.bandit.choose(action_ids, x_vec)
+        spec = SAFE_ACTIONS[chosen_action]
+
+        r = Recipe(
+            profile=f"bandit::{chosen_action}",
+            score=getattr(base, "score", 7.5),  # initial score; improves over time via learning
+            compression=compression,
+            layers=spec["layers"],
+            ciphers=spec["ciphers"][: spec["layers"]],
+            rationale=[
+                f"Advisor conf={advisor_conf if advisor_conf is not None else 'n/a'} < {self.min_conf}; bandit selected {chosen_action}.",
+                f"LinUCB scores: {{ {', '.join([f'{k}:{scores[k]:.3f}' for k in scores])} }}",
+                f"Features: {{ {', '.join([f'{k}:{feats[k]:.3f}' for k in feats])} }}",
+            ],
+            seed=_hash_seed(ctx),
+        )
+        return r
 
 # ---------- Factory ----------
 
-def get_engine(name: str) -> PolicyEngine:
-    name = (name or "rule").lower()
-    if name in {"rule", "rules"}:
-        return RuleBasedEngine()
-    if name in {"device_rule", "device", "device-aware"}:
-        return DeviceAwareRuleEngine()
-    if name in {"ml", "ml_stub"}:
+def get_engine(name: str) -> "PolicyEngine":
+    """
+    Factory for policy engines.
+
+    Supported names:
+      - "selfaware", "auto"  -> SelfAwareEngine (advisor + bandit + guardrails)
+      - "ml", "ml_stub"      -> MLClassifierEngine (static ML advisor)
+      - "rule", "rules", "heuristic" -> RuleEngine (deterministic heuristics)
+    """
+    n = (name or "rule").lower()
+
+    if n in {"selfaware", "auto"}:
+        return SelfAwareEngine()
+
+    if n in {"ml", "ml_stub"}:
         return MLClassifierEngine()
-    raise ValueError(f"Unknown policy backend '{name}'")
+
+    if n in {"rule", "rules", "heuristic"}:
+        return RuleEngine()
+
+    raise ValueError(f"Unknown engine: {name!r}. "
+                     f"Valid options: selfaware, ml, rule")
