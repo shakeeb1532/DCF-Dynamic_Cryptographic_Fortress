@@ -1,3 +1,4 @@
+# Copyright 2025 shakeeb1532
 import subprocess
 import threading
 import os
