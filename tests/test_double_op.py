@@ -1,3 +1,5 @@
+# Copyright 2025 shakeeb1532
+
 import subprocess
 import os
 
