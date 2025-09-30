@@ -1,5 +1,6 @@
 # Copyright 2025 shakeeb1532
 # fortress_mvp.py
+# Copyright 2025 shakeeb1532
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -10,8 +11,6 @@ import os
 import struct
 import sys
 import time
-import logging
-import threading
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
@@ -31,6 +30,13 @@ from cryptography.hazmat.primitives import serialization, hashes, constant_time
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.backends.openssl import backend as openssl_backend
 
+# Model admin + adaptive params
+from DCF.model_manager import (
+    approve_updates, revoke_updates, install_model, rollback_to_backup,
+    list_models, current_model_paths
+)
+from DCF.auto_params import observe_outcome
+
 MAGIC = b"FORTV6"
 VERSION = 1
 HEADER_STRUCT = ">I"  # uint32 header length
@@ -42,8 +48,6 @@ ALLOWED_CIPHERS = {
 }
 CHACHA_ALIASES = {"CHACHA20", "CHACHA20-POLY1305"}
 
-logging.basicConfig(level=logging.INFO)
-
 # ---------- utils ----------
 def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
@@ -54,8 +58,7 @@ def b64d(s: str) -> bytes:
 def is_fips_mode() -> bool:
     try:
         return openssl_backend.fips_mode_is_enabled()
-    except Exception as e:
-        logging.warning(f"FIPS mode check failed: {e}")
+    except Exception:
         return False
 
 def normalize_cipher_name(name: str) -> str:
@@ -64,34 +67,15 @@ def normalize_cipher_name(name: str) -> str:
         return "CHACHA20"
     return n
 
-# Per-thread key/nonce tracking
-_thread_local = threading.local()
-
 def validate_layer_params(alg: str, key: bytes, nonce: bytes) -> None:
-    if not hasattr(_thread_local, "used_keys"):
-        _thread_local.used_keys = set()
-    if not hasattr(_thread_local, "used_nonces"):
-        _thread_local.used_nonces = set()
     alg_norm = normalize_cipher_name(alg)
     if alg_norm not in ALLOWED_CIPHERS:
-        logging.error(f"Cipher not allowed: {alg}")
         raise ValueError(f"Cipher not allowed: {alg}")
     exp = ALLOWED_CIPHERS[alg_norm]
     if len(key) != exp["key_len"]:
-        logging.error(f"{alg} key must be {exp['key_len']} bytes, got {len(key)}")
         raise ValueError(f"{alg} key must be {exp['key_len']} bytes, got {len(key)}")
     if len(nonce) != exp["nonce_len"]:
-        logging.error(f"{alg} nonce must be {exp['nonce_len']} bytes, got {len(nonce)}")
         raise ValueError(f"{alg} nonce must be {exp['nonce_len']} bytes, got {len(nonce)}")
-    # Security check: prevent key/nonce reuse in thread
-    if key in _thread_local.used_keys:
-        logging.critical("Key reuse detected in thread! This is a severe security risk.")
-        raise ValueError("Key reuse detected in thread!")
-    if nonce in _thread_local.used_nonces:
-        logging.critical("Nonce reuse detected in thread! This is a severe security risk.")
-        raise ValueError("Nonce reuse detected in thread!")
-    _thread_local.used_keys.add(key)
-    _thread_local.used_nonces.add(nonce)
 
 # ---------- compression ----------
 def compress_blob(data: bytes, method: str) -> Tuple[bytes, Dict[str, str]]:
@@ -142,11 +126,6 @@ def aead_decrypt(alg: str, key: bytes, nonce: bytes, ciphertext: bytes, aad: Opt
 def apply_layers(plaintext: bytes, layers: List[LayerSpec]) -> bytes:
     out = plaintext
     aad = MAGIC
-    # Reset per-thread key/nonce tracking before encryption
-    if hasattr(_thread_local, "used_keys"):
-        _thread_local.used_keys.clear()
-    if hasattr(_thread_local, "used_nonces"):
-        _thread_local.used_nonces.clear()
     for layer in layers:
         out = aead_encrypt(layer.alg, layer.key, layer.nonce, out, aad)
     return out
@@ -154,11 +133,6 @@ def apply_layers(plaintext: bytes, layers: List[LayerSpec]) -> bytes:
 def peel_layers(ciphertext: bytes, layers: List[LayerSpec]) -> bytes:
     out = ciphertext
     aad = MAGIC
-    # Reset per-thread key/nonce tracking before decryption
-    if hasattr(_thread_local, "used_keys"):
-        _thread_local.used_keys.clear()
-    if hasattr(_thread_local, "used_nonces"):
-        _thread_local.used_nonces.clear()
     for layer in reversed(layers):
         out = aead_decrypt(layer.alg, layer.key, layer.nonce, out, aad)
     return out
@@ -310,6 +284,15 @@ def cmd_encrypt(args: argparse.Namespace) -> None:
         for idx, r in enumerate(plan.rationale or [], 1):
             print(f"  {idx}. {r}")
 
+    # ---- Adaptive feedback (preliminary) ----
+    try:
+        enc_size = os.path.getsize(args.out_path)
+        comp_ratio = max(0.0, 1.0 - (enc_size / max(1, len(raw))))  # ↑ better
+        perf_score = min(1.0, comp_ratio + (0.1 if plan.compression != "none" else 0.0) + (0.1 if plan.layers >= 3 else 0.0))
+        observe_outcome(success=True, perf_score=float(perf_score))
+    except Exception:
+        pass
+
 def cmd_decrypt(args: argparse.Namespace) -> None:
     header, payload = read_artifact(args.in_path)
 
@@ -342,6 +325,20 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
         f"Profile={recipe['profile']} score={recipe['score']} "
         f"layers={len(layers)} compression={recipe['compression']['alg']}"
     )
+
+    # ---- Adaptive feedback (authoritative) ----
+    try:
+        orig = recipe.get("compression", {}).get("orig")
+        if orig is not None:
+            orig = float(orig)
+            enc_size = os.path.getsize(args.in_path)
+            comp_ratio = max(0.0, 1.0 - (enc_size / max(1.0, orig)))
+        else:
+            comp_ratio = 0.0
+        perf_score = min(1.0, comp_ratio + (0.1 if len(layers) >= 3 else 0.0))
+        observe_outcome(success=True, perf_score=float(perf_score))
+    except Exception:
+        pass
 
 # ---------- helpers ----------
 def infer_file_type(path: str) -> str:
@@ -389,6 +386,43 @@ def build_cli() -> argparse.ArgumentParser:
     p_dec.add_argument("--recipient-priv", required=True)
     p_dec.set_defaults(func=cmd_decrypt)
 
+    # ---- model admin ----
+    p_m = sub.add_parser("model", help="model admin commands")
+    msub = p_m.add_subparsers(dest="mcmd", required=True)
+
+    p_m_approve = msub.add_parser("approve-updates", help="owner consent for updates")
+    p_m_approve.set_defaults(func=lambda args: (approve_updates(), print("✅ Updates approved by owner")))
+
+    p_m_revoke = msub.add_parser("revoke-updates", help="revoke owner consent")
+    p_m_revoke.set_defaults(func=lambda args: (revoke_updates(), print("🛑 Updates revoked")))
+
+    p_m_install = msub.add_parser("install", help="install model from local files")
+    p_m_install.add_argument("--model", required=True)
+    p_m_install.add_argument("--meta", required=True)
+    def _do_install(a):
+        entry = install_model(a.model, a.meta)
+        print(f"✅ Installed model v={entry.version} sha256={entry.sha256[:12]}…")
+    p_m_install.set_defaults(func=_do_install)
+
+    p_m_list = msub.add_parser("list", help="list installed/current model(s)")
+    def _do_list(a):
+        cur = current_model_paths()
+        if cur:
+            print(f"Current: v={cur.version} sha256={cur.sha256[:12]}… at {cur.path_model}")
+        else:
+            print("No current model")
+        for e in list_models():
+            ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.installed_ts))
+            print(f"- v={e.version} sha256={e.sha256[:12]}… installed={ts}")
+    p_m_list.set_defaults(func=_do_list)
+
+    p_m_rb = msub.add_parser("rollback", help="rollback to a backup")
+    p_m_rb.add_argument("--to", default=None, help="timestamp prefix (e.g., 20250930-12)")
+    def _do_rb(a):
+        stamp = rollback_to_backup(a.to)
+        print(f"🔁 Rolled back to backup {stamp}")
+    p_m_rb.set_defaults(func=_do_rb)
+
     return p
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -404,3 +438,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
