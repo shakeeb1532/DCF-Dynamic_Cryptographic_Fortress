@@ -11,13 +11,13 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Protocol, Any
 
-# Optional ML deps
+# ===== Optional ML deps =====
 try:
-    import joblib  # keep optional; engine still loads without it
+    import joblib  # model loader
 except Exception:
     joblib = None
 
-# ===== Models / Protocols =====
+# ===== Public data models =====
 
 @dataclass
 class Context:
@@ -64,14 +64,14 @@ def _choose_compression_by_size(size_bytes: int) -> str:
         return "zlib"
     return "lz4"
 
-# ===== Simple Rule/Heuristic Engine (safe baseline) =====
+# ===== Rule/Heuristic Engine (safe baseline) =====
 
 class RuleEngine:
     """
-    Deterministic, conservative baseline:
-      - RFC1918 and small files → lighter policy
-      - public destinations and large files → stronger policy
-      - AEAD only, minimum 2 layers
+    Deterministic baseline:
+      - RFC1918 + small files → lighter policy
+      - public IP + large files → stronger policy
+      - AEAD only, min 2 layers
     """
     def plan(self, ctx: Context) -> Recipe:
         mb = ctx.file_size_bytes / (1024 * 1024)
@@ -79,22 +79,18 @@ class RuleEngine:
         compression = _choose_compression_by_size(ctx.file_size_bytes)
 
         if private and mb < 8:
-            profile = "rule_low_risk"
-            layers = 2
+            profile, layers = "rule_low_risk", 2
         elif mb < 64:
-            profile = "rule_medium_risk"
-            layers = 3
+            profile, layers = "rule_medium_risk", 3
         elif mb < 256:
-            profile = "rule_high_risk"
-            layers = 3
+            profile, layers = "rule_high_risk", 3
         else:
-            profile = "rule_extreme_risk"
-            layers = 4
+            profile, layers = "rule_extreme_risk", 4
 
         ciphers = ["AESGCM", "ChaCha20-Poly1305", "AESGCM", "ChaCha20-Poly1305"]
         rationale = [
             f"private_dest={private}, size_mb={mb:.2f}, compression={compression}",
-            "AEAD-only allow-list; minimum 2 layers enforced.",
+            "AEAD allow-list; min 2 layers.",
         ]
         return Recipe(
             profile=profile,
@@ -106,19 +102,19 @@ class RuleEngine:
             seed=_hash_seed(ctx),
         )
 
-# ===== ML Classifier Engine (optional advisor) =====
+# ===== ML Classifier Engine (advisor) =====
 
 class MLClassifierEngine:
     """
-    ML-backed advisor. Uses a scikit-learn model saved via joblib.
-    Safe even if joblib/model missing: we fall back to RuleEngine.
+    ML-backed advisor. Uses a scikit-learn pipeline saved via joblib.
+    Safe even if joblib/model missing: falls back to RuleEngine.
     """
-    MODEL_FILENAME = "dcf_model.joblib"
-    META_FILENAME  = "dcf_model.meta.json"
+    MODEL_FILENAME = "models/dcf_model.joblib"  # looks in models/ by default
+    META_FILENAME  = "models/dcf_model.meta.json"
 
     def __init__(self, model_path: Optional[str] = None, min_confidence: float = 0.55):
         self.model_path = model_path or self.MODEL_FILENAME
-        self.meta_path  = os.path.join(os.path.dirname(self.model_path), self.META_FILENAME)
+        self.meta_path  = self.META_FILENAME if model_path is None else os.path.join(os.path.dirname(model_path), "dcf_model.meta.json")
         self.model = None
         self.min_confidence = float(min_confidence)
         self._feature_names: Optional[List[str]] = None
@@ -145,7 +141,7 @@ class MLClassifierEngine:
                     self.meta = json.load(f)
             except Exception:
                 pass
-        logger.info("✅ ML model loaded")
+        logger.info("✅ ML model loaded from %s", self.model_path)
 
     # --- features ---
     def _feats_dict(self, ctx: Context) -> Dict[str, float]:
@@ -189,7 +185,6 @@ class MLClassifierEngine:
             except Exception:
                 conf = None
 
-        # map label -> policy
         profile_map = {
             0: ("ml_low_risk",    2, ["AESGCM","ChaCha20-Poly1305"]),
             1: ("ml_medium_risk", 3, ["AESGCM","ChaCha20-Poly1305","AESGCM"]),
@@ -199,7 +194,7 @@ class MLClassifierEngine:
         profile, layers, ciphers = profile_map.get(label, profile_map[1])
         compression = _choose_compression_by_size(ctx.file_size_bytes)
         base = (label + 1) * 2.5
-        score = round(base * (0.9 + 0.2 * (conf if conf is not None else 0.5)), 2)
+        score = round(base * (0.9 + 0.2 * (conf if conf is not None else 0.5))), 2
 
         rationale = [
             f"ML predicted label={label}{f' (conf={conf:.2f})' if conf is not None else ''}.",
@@ -208,7 +203,7 @@ class MLClassifierEngine:
         ]
         return Recipe(
             profile=profile,
-            score=score,
+            score=score if isinstance(score, float) else float(score[0]),
             compression=compression,
             layers=layers,
             ciphers=ciphers[:layers],
@@ -216,10 +211,11 @@ class MLClassifierEngine:
             seed=_hash_seed(ctx),
         )
 
-# ===== Self-Aware Engine (Advisor + Bandit + Guardrails) =====
+# ===== Self-Aware Engine (Advisor + Bandit + Guardrails + Auto-params) =====
 
 from DCF.features import ctx_to_feature_dict, feats_to_vector, FEATURE_KEYS
 from DCF.optimizer_bandit import BanditOptimizer
+from DCF.auto_params import suggest_params  # auto-tuned min_confidence & bandit alpha
 
 SAFE_ACTIONS = {
     "safe_l2_aes_chacha": dict(layers=2, ciphers=["AESGCM","ChaCha20-Poly1305"]),
@@ -248,10 +244,12 @@ class SelfAwareEngine:
       - Advisor (ML if available; else rules)
       - Optimizer (LinUCB contextual bandit across SAFE_ACTIONS)
       - Guardrails (minimum security; AEAD-only)
+      - Auto-params (min_confidence, bandit_alpha from runtime telemetry)
     """
-    def __init__(self, min_confidence: float = 0.60, alpha: float = 0.8):
-        self.min_conf = float(min_confidence)
-        self.bandit = BanditOptimizer(d=len(FEATURE_KEYS), alpha=alpha)
+    def __init__(self):
+        aps = suggest_params()  # reads auto_params_state.json
+        self.min_conf = float(aps.min_confidence)
+        self.bandit = BanditOptimizer(d=len(FEATURE_KEYS), alpha=float(aps.bandit_alpha))
         try:
             self._advisor = MLClassifierEngine() if joblib is not None else RuleEngine()
         except Exception:
@@ -265,13 +263,11 @@ class SelfAwareEngine:
         advisor_conf = _extract_confidence_from_rationale(base.rationale)
         compression = _choose_compression_by_size(ctx.file_size_bytes)
 
-        # confident advisor + safe policy → accept
         if advisor_conf is not None and advisor_conf >= self.min_conf and _recipe_is_safe(base):
             base.compression = compression
             (base.rationale or []).insert(0, f"Advisor confident ({advisor_conf:.2f}); using advisor recipe.")
             return base
 
-        # otherwise bandit over safe actions
         action_ids = list(SAFE_ACTIONS.keys())
         chosen_action, scores = self.bandit.choose(action_ids, x_vec)
         spec = SAFE_ACTIONS[chosen_action]
