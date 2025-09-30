@@ -1,38 +1,7 @@
 # Copyright 2025 shakeeb1532
+# fortress_mvp.py
+# Copyright 2025 shakeeb1532
 #!/usr/bin/env python3
-"""
-Dynamic Cryptographic Fortress — Minimal Viable Product (single-file CLI)
-
-Implements the core ideas from the white paper:
- - Threat-adaptive policy (destination-aware risk score → security profile)
- - Content-aware pre-processing (compression strategy)
- - Layered AEAD encryption (AES-GCM / ChaCha20-Poly1305)
- - Hybrid header encapsulation (RSA-4096 → AES-GCM encrypts the recipe)
- - Self-contained .fortress artifact with magic header and JSON metadata
-
-Usage
------
-# Create an RSA keypair
-python fortress_mvp.py keygen --out-dir keys
-
-# Encrypt a file
-python fortress_mvp.py encrypt \
-  --in secret.bin --out secret.fortress \
-  --dest-ip 216.3.128.12 \
-  --recipient-pub keys/public.pem \
-  --file-type auto
-
-# Decrypt a file
-python fortress_mvp.py decrypt \
-  --in secret.fortress --out recovered.bin \
-  --recipient-priv keys/private.pem
-
-Notes
------
-* Requires Python 3.9+
-* Depends on: cryptography, lz4 (optional)
-* This is an MVP intended for experimentation and extension — not production
-"""
 from __future__ import annotations
 
 import argparse
@@ -45,10 +14,9 @@ import time
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
-# Policy engine
 from policy_engine import get_engine, Context
 
-# --- Optional compression backend(s) ---
+# Optional compression
 try:
     import lz4.frame as lz4f
     HAVE_LZ4 = True
@@ -56,24 +24,24 @@ except Exception:
     HAVE_LZ4 = False
 import zlib
 
-# --- Crypto primitives ---
+# Crypto
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives import serialization, hashes, constant_time
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.backends.openssl import backend as openssl_backend
 
-MAGIC = b"FORTV6"   # 6 bytes
-VERSION = 1          # echoed inside the sealed recipe too
-HEADER_STRUCT = ">I" # 4-byte big-endian unsigned for header length
+MAGIC = b"FORTV6"
+VERSION = 1
+HEADER_STRUCT = ">I"  # uint32 header length
 
-# ---- Cipher allow-list & expected sizes ----
+# Cipher allow-list
 ALLOWED_CIPHERS = {
-    "AESGCM": {"key_len": 32, "nonce_len": 12},             # 256-bit key, 96-bit nonce
-    "CHACHA20": {"key_len": 32, "nonce_len": 12},           # normalized name for ChaCha20-Poly1305
+    "AESGCM": {"key_len": 32, "nonce_len": 12},
+    "CHACHA20": {"key_len": 32, "nonce_len": 12},  # normalize ChaCha20-Poly1305 to CHACHA20
 }
 CHACHA_ALIASES = {"CHACHA20", "CHACHA20-POLY1305"}
 
-# -------- Utilities --------
+# ---------- utils ----------
 def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
@@ -102,7 +70,7 @@ def validate_layer_params(alg: str, key: bytes, nonce: bytes) -> None:
     if len(nonce) != exp["nonce_len"]:
         raise ValueError(f"{alg} nonce must be {exp['nonce_len']} bytes, got {len(nonce)}")
 
-# -------- Compression --------
+# ---------- compression ----------
 def compress_blob(data: bytes, method: str) -> Tuple[bytes, Dict[str, str]]:
     m = (method or "none").lower()
     if m == "lz4" and HAVE_LZ4:
@@ -123,9 +91,12 @@ def decompress_blob(data: bytes, meta: Dict[str, str]) -> bytes:
         return zlib.decompress(data)
     return data
 
-# -------- Layered AEAD --------
-def rand_bytes(n: int) -> bytes:
-    return os.urandom(n)
+# ---------- layered AEAD ----------
+@dataclass
+class LayerSpec:
+    alg: str
+    key: bytes
+    nonce: bytes
 
 def aead_encrypt(alg: str, key: bytes, nonce: bytes, plaintext: bytes, aad: Optional[bytes]=None) -> bytes:
     alg_norm = normalize_cipher_name(alg)
@@ -145,15 +116,9 @@ def aead_decrypt(alg: str, key: bytes, nonce: bytes, ciphertext: bytes, aad: Opt
         return ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
     raise ValueError(f"Unknown AEAD alg {alg}")
 
-@dataclass
-class LayerSpec:
-    alg: str
-    key: bytes
-    nonce: bytes
-
 def apply_layers(plaintext: bytes, layers: List[LayerSpec]) -> bytes:
     out = plaintext
-    aad = MAGIC  # bind artifact type across layers
+    aad = MAGIC
     for layer in layers:
         out = aead_encrypt(layer.alg, layer.key, layer.nonce, out, aad)
     return out
@@ -165,7 +130,7 @@ def peel_layers(ciphertext: bytes, layers: List[LayerSpec]) -> bytes:
         out = aead_decrypt(layer.alg, layer.key, layer.nonce, out, aad)
     return out
 
-# -------- Hybrid Header (RSA-4096 → AES-GCM for recipe) --------
+# ---------- RSA header sealing ----------
 def load_public_key(path: str):
     with open(path, "rb") as f:
         return serialization.load_pem_public_key(f.read())
@@ -188,7 +153,7 @@ def rsa_decrypt(privkey, blob: bytes) -> bytes:
                      algorithm=hashes.SHA256(), label=None)
     )
 
-# -------- Artifact framing --------
+# ---------- artifact I/O ----------
 def write_artifact(out_path: str, header_json: dict, payload: bytes) -> None:
     header_bytes = json.dumps(header_json, separators=(",", ":")).encode("utf-8")
     with open(out_path, "wb") as f:
@@ -207,7 +172,7 @@ def read_artifact(in_path: str) -> Tuple[dict, bytes]:
         payload = f.read()
     return header, payload
 
-# -------- Commands --------
+# ---------- commands ----------
 def cmd_keygen(args: argparse.Namespace) -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     priv = rsa.generate_private_key(public_exponent=65537, key_size=4096)
@@ -224,13 +189,11 @@ def cmd_keygen(args: argparse.Namespace) -> None:
     print(f"Wrote {args.out_dir}/private.pem and {args.out_dir}/public.pem")
 
 def cmd_encrypt(args: argparse.Namespace) -> None:
-    # Load input
     with open(args.in_path, "rb") as f:
         raw = f.read()
 
     file_type = args.file_type if args.file_type != "auto" else infer_file_type(args.in_path)
 
-    # Policy engine plan → recipe
     engine = get_engine(args.policy_backend)
     ctx = Context(
         dest_ip=args.dest_ip,
@@ -246,11 +209,10 @@ def cmd_encrypt(args: argparse.Namespace) -> None:
     )
     plan = engine.plan(ctx)
 
-    # Compress according to plan
+    # compress per plan
     comp_blob, comp_meta = compress_blob(raw, plan.compression)
 
-    # Build layered cipher plan from policy output
-    # Ensure plan.ciphers has enough elements for plan.layers
+    # build layers
     ciphers = list(plan.ciphers or [])
     if len(ciphers) < int(plan.layers):
         ciphers = (ciphers * ((int(plan.layers) // max(1, len(ciphers))) + 1))[: int(plan.layers)]
@@ -263,15 +225,13 @@ def cmd_encrypt(args: argparse.Namespace) -> None:
         validate_layer_params(alg, key, nonce)
         layers.append(LayerSpec(alg, key, nonce))
 
-    # Apply encryption layers to compressed blob
     layered_ct = apply_layers(comp_blob, layers)
 
-    # Build recipe JSON (keys, nonces, order, compression, meta)
     recipe = {
         "version": VERSION,
         "profile": plan.profile,
         "score": plan.score,
-        "compression": comp_meta,  # {'alg': 'lz4'|'zlib'|'none', 'orig': str(n)}
+        "compression": comp_meta,
         "layers": [
             {"alg": L.alg, "key": b64e(L.key), "nonce": b64e(L.nonce)} for L in layers
         ],
@@ -284,13 +244,13 @@ def cmd_encrypt(args: argparse.Namespace) -> None:
         "fips_mode": bool(is_fips_mode()),
     }
 
-    # Envelope-encrypt recipe with AES-GCM; AES key is RSA-encrypted
+    # seal recipe (AES-GCM) and wrap session key (RSA-OAEP)
     session_key = os.urandom(32)
     header_nonce = os.urandom(12)
     enc_recipe = AESGCM(session_key).encrypt(
         header_nonce,
         json.dumps(recipe, separators=(",", ":")).encode("utf-8"),
-        MAGIC,  # AAD binds to artifact magic
+        MAGIC,
     )
 
     pub = load_public_key(args.recipient_pub)
@@ -327,7 +287,6 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
     )
     recipe = json.loads(recipe_bytes.decode("utf-8"))
 
-    # Rebuild layers
     layers = [
         LayerSpec(
             normalize_cipher_name(L["alg"]),
@@ -336,14 +295,10 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
         )
         for L in recipe["layers"]
     ]
-    # Validate before use
     for L in layers:
         validate_layer_params(L.alg, L.key, L.nonce)
 
-    # Peel layers
     comp_blob = peel_layers(payload, layers)
-
-    # Decompress
     raw = decompress_blob(comp_blob, recipe["compression"])
 
     with open(args.out_path, "wb") as f:
@@ -355,7 +310,7 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
         f"layers={len(layers)} compression={recipe['compression']['alg']}"
     )
 
-# -------- Helpers --------
+# ---------- helpers ----------
 def infer_file_type(path: str) -> str:
     ext = os.path.splitext(path)[1].lower().strip('.')
     if ext in ("mp4", "mov", "mkv", "avi"):
@@ -368,14 +323,14 @@ def infer_file_type(path: str) -> str:
         return "document"
     return ext or "binary"
 
-# -------- CLI --------
+# ---------- CLI ----------
 def build_cli() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Dynamic Cryptographic Fortress — MVP")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_keygen = sub.add_parser("keygen", help="generate RSA-4096 keypair")
-    p_keygen.add_argument("--out-dir", default="keys")
-    p_keygen.set_defaults(func=cmd_keygen)
+    p_key = sub.add_parser("keygen", help="generate RSA-4096 keypair")
+    p_key.add_argument("--out-dir", default="keys")
+    p_key.set_defaults(func=cmd_keygen)
 
     p_enc = sub.add_parser("encrypt", help="encrypt a file into .fortress artifact")
     p_enc.add_argument("--in", dest="in_path", required=True)
@@ -384,7 +339,6 @@ def build_cli() -> argparse.ArgumentParser:
     p_enc.add_argument("--recipient-pub", required=True)
     p_enc.add_argument("--file-type", default="auto",
                        help="auto|video|archive|data|document|binary|<ext>")
-    # Expose the new backend; keep compatibility aliases if your factory supports them
     p_enc.add_argument("--policy-backend", default="selfaware",
                        help="selfaware|ml|rule|rules|device_rule")
     p_enc.add_argument("--device-class", default="server",
@@ -393,8 +347,7 @@ def build_cli() -> argparse.ArgumentParser:
     p_enc.add_argument("--bandwidth-mbps", type=float, default=100.0)
     p_enc.add_argument("--latency-budget-ms", type=int, default=1000)
     p_enc.add_argument("--battery-saver", action="store_true")
-    p_enc.add_argument("--explain", action="store_true",
-                       help="print rationale for chosen policy")
+    p_enc.add_argument("--explain", action="store_true", help="print rationale for chosen policy")
     p_enc.set_defaults(func=cmd_encrypt)
 
     p_dec = sub.add_parser("decrypt", help="decrypt a .fortress artifact")
