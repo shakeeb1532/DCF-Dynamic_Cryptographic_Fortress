@@ -1,5 +1,7 @@
 # DCF/optimizer_bandit.py
-# Minimal LinUCB contextual bandit with on-disk persistence.
+
+from __future__ import annotations
+
 from typing import Dict, List, Tuple
 import json
 import math
@@ -28,8 +30,7 @@ class LinUCB:
         A_inv = np.linalg.inv(A)
         theta = A_inv @ b
         x = x_vec.reshape((self.d, 1))
-        ucb = float((theta.T @ x) + self.alpha * math.sqrt(float(x.T @ A_inv @ x)))
-        return ucb
+        return float((theta.T @ x) + self.alpha * math.sqrt(float(x.T @ A_inv @ x)))
 
     def update(self, a: str, x_vec: np.ndarray, reward: float):
         if a not in self.actions:
@@ -43,7 +44,7 @@ class LinUCB:
 
 class BanditOptimizer:
     """
-    Wraps LinUCB, persists state to a JSON file so learning survives restarts.
+    LinUCB wrapper with simple JSON persistence so learning survives restarts.
     """
     def __init__(self, d: int, alpha: float = 0.8, state_path: str = "bandit_state.json"):
         self.lucb = LinUCB(d=d, alpha=alpha)
@@ -61,8 +62,7 @@ class BanditOptimizer:
                 b = np.array(dct["b"], dtype=float).reshape((self.lucb.d, 1))
                 self.lucb.actions[a] = {"A": A, "b": b}
         except Exception:
-            # Non-fatal: start fresh
-            pass
+            pass  # non-fatal
 
     def _save(self):
         try:
