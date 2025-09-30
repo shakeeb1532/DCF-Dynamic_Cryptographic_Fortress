@@ -142,6 +142,11 @@ def aead_decrypt(alg: str, key: bytes, nonce: bytes, ciphertext: bytes, aad: Opt
 def apply_layers(plaintext: bytes, layers: List[LayerSpec]) -> bytes:
     out = plaintext
     aad = MAGIC
+    # Reset per-thread key/nonce tracking before encryption
+    if hasattr(_thread_local, "used_keys"):
+        _thread_local.used_keys.clear()
+    if hasattr(_thread_local, "used_nonces"):
+        _thread_local.used_nonces.clear()
     for layer in layers:
         out = aead_encrypt(layer.alg, layer.key, layer.nonce, out, aad)
     return out
@@ -149,6 +154,11 @@ def apply_layers(plaintext: bytes, layers: List[LayerSpec]) -> bytes:
 def peel_layers(ciphertext: bytes, layers: List[LayerSpec]) -> bytes:
     out = ciphertext
     aad = MAGIC
+    # Reset per-thread key/nonce tracking before decryption
+    if hasattr(_thread_local, "used_keys"):
+        _thread_local.used_keys.clear()
+    if hasattr(_thread_local, "used_nonces"):
+        _thread_local.used_nonces.clear()
     for layer in reversed(layers):
         out = aead_decrypt(layer.alg, layer.key, layer.nonce, out, aad)
     return out
