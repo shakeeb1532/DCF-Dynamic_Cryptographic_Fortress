@@ -1,6 +1,5 @@
 # Copyright 2025 shakeeb1532
 # fortress_mvp.py
-# Copyright 2025 shakeeb1532
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -11,6 +10,8 @@ import os
 import struct
 import sys
 import time
+import logging
+import threading
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
@@ -41,6 +42,8 @@ ALLOWED_CIPHERS = {
 }
 CHACHA_ALIASES = {"CHACHA20", "CHACHA20-POLY1305"}
 
+logging.basicConfig(level=logging.INFO)
+
 # ---------- utils ----------
 def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
@@ -51,7 +54,8 @@ def b64d(s: str) -> bytes:
 def is_fips_mode() -> bool:
     try:
         return openssl_backend.fips_mode_is_enabled()
-    except Exception:
+    except Exception as e:
+        logging.warning(f"FIPS mode check failed: {e}")
         return False
 
 def normalize_cipher_name(name: str) -> str:
@@ -60,15 +64,34 @@ def normalize_cipher_name(name: str) -> str:
         return "CHACHA20"
     return n
 
+# Per-thread key/nonce tracking
+_thread_local = threading.local()
+
 def validate_layer_params(alg: str, key: bytes, nonce: bytes) -> None:
+    if not hasattr(_thread_local, "used_keys"):
+        _thread_local.used_keys = set()
+    if not hasattr(_thread_local, "used_nonces"):
+        _thread_local.used_nonces = set()
     alg_norm = normalize_cipher_name(alg)
     if alg_norm not in ALLOWED_CIPHERS:
+        logging.error(f"Cipher not allowed: {alg}")
         raise ValueError(f"Cipher not allowed: {alg}")
     exp = ALLOWED_CIPHERS[alg_norm]
     if len(key) != exp["key_len"]:
+        logging.error(f"{alg} key must be {exp['key_len']} bytes, got {len(key)}")
         raise ValueError(f"{alg} key must be {exp['key_len']} bytes, got {len(key)}")
     if len(nonce) != exp["nonce_len"]:
+        logging.error(f"{alg} nonce must be {exp['nonce_len']} bytes, got {len(nonce)}")
         raise ValueError(f"{alg} nonce must be {exp['nonce_len']} bytes, got {len(nonce)}")
+    # Security check: prevent key/nonce reuse in thread
+    if key in _thread_local.used_keys:
+        logging.critical("Key reuse detected in thread! This is a severe security risk.")
+        raise ValueError("Key reuse detected in thread!")
+    if nonce in _thread_local.used_nonces:
+        logging.critical("Nonce reuse detected in thread! This is a severe security risk.")
+        raise ValueError("Nonce reuse detected in thread!")
+    _thread_local.used_keys.add(key)
+    _thread_local.used_nonces.add(nonce)
 
 # ---------- compression ----------
 def compress_blob(data: bytes, method: str) -> Tuple[bytes, Dict[str, str]]:
