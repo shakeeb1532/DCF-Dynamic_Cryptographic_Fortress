@@ -1,4 +1,3 @@
-# Copyright 2025 shakeeb1532
 # fortress_mvp.py
 # Copyright 2025 shakeeb1532
 #!/usr/bin/env python3
@@ -396,11 +395,13 @@ def build_cli() -> argparse.ArgumentParser:
     p_m_revoke = msub.add_parser("revoke-updates", help="revoke owner consent")
     p_m_revoke.set_defaults(func=lambda args: (revoke_updates(), print("🛑 Updates revoked")))
 
-    p_m_install = msub.add_parser("install", help="install model from local files")
-    p_m_install.add_argument("--model", required=True)
-    p_m_install.add_argument("--meta", required=True)
+    p_m_install = msub.add_parser("install", help="install model from local files (signature required)")
+    p_m_install.add_argument("--model", required=True, help="path to dcf_model.joblib")
+    p_m_install.add_argument("--meta", required=True, help="path to dcf_model.meta.json")
+    p_m_install.add_argument("--sig",  required=True, help="path to detached signature for the model")
+    p_m_install.add_argument("--pubkey", required=True, help="path to signer public key (Ed25519 or RSA)")
     def _do_install(a):
-        entry = install_model(a.model, a.meta)
+        entry = install_model(a.model, a.meta, sig_path=a.sig, pubkey_path=a.pubkey)
         print(f"✅ Installed model v={entry.version} sha256={entry.sha256[:12]}…")
     p_m_install.set_defaults(func=_do_install)
 
@@ -438,4 +439,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
 
